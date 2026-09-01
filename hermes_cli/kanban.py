@@ -310,6 +310,8 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     b_list.add_argument("--json", action="store_true")
     b_list.add_argument("--all", action="store_true",
                         help="Include archived boards too")
+    b_list.add_argument("--tag", action="append", default=[], metavar="NAME",
+                        help="Filter by tag (repeatable = AND)")
 
     b_create = boards_sub.add_parser(
         "create", aliases=["new"],
@@ -329,6 +331,9 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                           help="Switch to the new board after creating it")
     b_create.add_argument("--default-workdir", default=None,
                           help="Default workspace path for tasks created on this board")
+    b_create.add_argument("--tags", default=None,
+                          help="Comma-separated existing tag names "
+                               "(create them first with `hermes tag create`)")
 
     b_rm = boards_sub.add_parser(
         "rm", aliases=["remove", "delete"],
@@ -349,6 +354,12 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         "show", aliases=["current"],
         help="Print the currently-active board slug",
     )
+
+    b_tag = boards_sub.add_parser(
+        "tag", help="Add/remove board tags: '+name' adds, '-name' removes",
+    )
+    b_tag.add_argument("slug")
+    b_tag.add_argument("spec", help='e.g. "+client-acme,-old"')
 
     b_rename = boards_sub.add_parser(
         "rename",
@@ -1309,6 +1320,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
 _DELEGATED_CHILD_DENIED_BOARD_ACTIONS: frozenset[str] = frozenset({
     "create",
     "new",
+    "tag",
     "rm",
     "remove",
     "delete",
@@ -1359,6 +1371,8 @@ def _dispatch_boards(args: argparse.Namespace) -> int:
         return _cmd_boards_switch(args)
     if sub in {"show", "current"}:
         return _cmd_boards_show(args)
+    if sub == "tag":
+        return _cmd_boards_tag(args)
     if sub == "rename":
         return _cmd_boards_rename(args)
     if sub == "set-default-workdir":
@@ -1386,21 +1400,44 @@ def _board_task_counts(slug: str) -> dict[str, int]:
         return {}
 
 
+def _board_tag_map(slugs) -> dict[str, list[str]]:
+    """Bulk ``board slug -> [tag names]``. Best-effort, one query."""
+    try:
+        with tags_db.connect_closing() as tconn:
+            return tags_db.tags_for_entities(tconn, "board", list(slugs))
+    except Exception:
+        return {}
+
+
 def _cmd_boards_list(args: argparse.Namespace) -> int:
     include_archived = bool(getattr(args, "all", False))
     boards = kb.list_boards(include_archived=include_archived)
+    wanted = getattr(args, "tag", None)
+    if wanted:
+        try:
+            with tags_db.connect_closing() as tconn:
+                keys = tags_db.entity_keys_for_tags(tconn, "board", wanted)
+        except ValueError as exc:
+            print(f"kanban boards list: {exc}", file=sys.stderr)
+            return 2
+        boards = [b for b in boards if b["slug"] in keys]
     # Enrich each entry with task counts + whether it's the current board.
     current = kb.get_current_board()
+    tag_map = _board_tag_map([b["slug"] for b in boards])
     for b in boards:
         b["is_current"] = (b["slug"] == current)
         b["counts"] = _board_task_counts(b["slug"])
         b["total"] = sum(b["counts"].values())
+        b["tags"] = tag_map.get(b["slug"], [])
     if getattr(args, "json", False):
         print(json.dumps(boards, indent=2, ensure_ascii=False))
         return 0
     # Human table: marker (•) for current, slug, display name, counts.
     if not boards:
-        print("(no boards — create one with `hermes kanban boards create <slug>`)")
+        if wanted:
+            print(f"(no boards tagged {', '.join(wanted)})")
+        else:
+            print("(no boards — create one with `hermes kanban boards create <slug>`)")
         return 0
     print(f"{'':2s}  {'SLUG':24s}  {'NAME':28s}  COUNTS")
     for b in boards:
@@ -1413,7 +1450,9 @@ def _cmd_boards_list(args: argparse.Namespace) -> int:
         name = b.get("name") or ""
         if b.get("archived"):
             name += " [archived]"
-        print(f"{marker:2s}  {b['slug']:24s}  {name:28s}  {counts_str}")
+        tags = b.get("tags") or []
+        suffix = "  " + " ".join(f"#{n}" for n in tags) if tags else ""
+        print(f"{marker:2s}  {b['slug']:24s}  {name:28s}  {counts_str}{suffix}")
     print()
     print(f"Current board: {current}")
     if len(boards) > 1:
@@ -1439,6 +1478,14 @@ def _cmd_boards_create(args: argparse.Namespace) -> int:
         color=args.color,
         default_workdir=args.default_workdir,
     )
+    if getattr(args, "tags", None):
+        try:
+            with tags_db.connect_closing() as tconn:
+                tags_db.apply_spec(tconn, "board", meta["slug"], args.tags)
+        except ValueError as exc:
+            print(f"kanban boards create: {exc}", file=sys.stderr)
+            print(f"Board {meta['slug']!r} created (untagged).", file=sys.stderr)
+            return 2
     verb = "already exists" if already else "created"
     print(f"Board {meta['slug']!r} {verb}.")
     print(f"  Display name: {meta.get('name', '')}")
@@ -1448,6 +1495,30 @@ def _cmd_boards_create(args: argparse.Namespace) -> int:
         print(f"  Switched to {meta['slug']!r}.")
     else:
         print(f"  Use `hermes kanban boards switch {meta['slug']}` to make it current.")
+    return 0
+
+
+def _cmd_boards_tag(args: argparse.Namespace) -> int:
+    try:
+        normed = kb._normalize_board_slug(args.slug)
+    except ValueError as exc:
+        print(f"kanban boards tag: {exc}", file=sys.stderr)
+        return 2
+    if not normed or not kb.board_exists(normed):
+        print(f"kanban boards tag: unknown board {args.slug!r}", file=sys.stderr)
+        return 2
+    try:
+        with tags_db.connect_closing() as tconn:
+            added, removed = tags_db.apply_spec(tconn, "board", normed, args.spec)
+    except ValueError as exc:
+        print(f"kanban boards tag: {exc}", file=sys.stderr)
+        return 2
+    for name in added:
+        print(f"+ {name}")
+    for name in removed:
+        print(f"- {name}")
+    if not added and not removed:
+        print("No changes.")
     return 0
 
 

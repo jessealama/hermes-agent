@@ -128,3 +128,54 @@ def test_task_tags_are_board_scoped(kanban_home, capsys):
         task_id = kb.list_tasks(conn)[0].id
     with tdb.connect_closing() as conn:
         assert tdb.tags_for_entity(conn, "task", tdb.task_key("other", task_id)) == []
+
+
+# ---------------------------------------------------------------------------
+# Board tagging
+# ---------------------------------------------------------------------------
+
+def test_board_tagging_and_filter(kanban_home, capsys):
+    _seed_tags("acme")
+    _run(["boards", "create", "acme-board"])
+    _run(["boards", "create", "other-board"])
+    assert _run(["boards", "tag", "acme-board", "+acme"]) == 0
+    capsys.readouterr()
+    assert _run(["boards", "list", "--tag", "acme"]) == 0
+    out = capsys.readouterr().out
+    assert "acme-board" in out and "other-board" not in out
+
+
+def test_boards_create_with_tags(kanban_home, capsys):
+    _seed_tags("acme")
+    assert _run(["boards", "create", "tagged-board", "--tags", "acme"]) == 0
+    with tdb.connect_closing() as conn:
+        assert tdb.tags_for_entity(conn, "board", "tagged-board") == ["acme"]
+
+
+def test_boards_tag_unknown_board_errors(kanban_home, capsys):
+    _seed_tags("acme")
+    assert _run(["boards", "tag", "ghost-board", "+acme"]) == 2
+    assert "unknown board" in capsys.readouterr().err
+
+
+def test_boards_list_json_carries_tags(kanban_home, capsys):
+    _seed_tags("acme")
+    _run(["boards", "create", "acme-board", "--tags", "acme"])
+    capsys.readouterr()
+    assert _run(["boards", "list", "--json"]) == 0
+    rows = json.loads(capsys.readouterr().out)
+    by_slug = {r["slug"]: r for r in rows}
+    assert by_slug["acme-board"]["tags"] == ["acme"]
+    assert by_slug["default"]["tags"] == []
+
+
+def test_remove_board_detaches_tags(kanban_home, capsys):
+    _seed_tags("acme")
+    _run(["boards", "create", "doomed"])
+    _run(["boards", "tag", "doomed", "+acme"])
+    # A task on that board must go too — a reused slug must start clean.
+    with tdb.connect_closing() as conn:
+        tdb.apply_spec(conn, "task", tdb.task_key("doomed", "t_1"), "+acme")
+    kb.remove_board("doomed", archive=True)
+    with tdb.connect_closing() as conn:
+        assert tdb.entities_for_tag(conn, "acme") == {}
