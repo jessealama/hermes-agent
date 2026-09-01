@@ -1,0 +1,131 @@
+"""Per-profile tag registry + generic entity tag assignments.
+
+One user-curated vocabulary (issue #100285) shared by every taggable entity
+type. Assignments reference entities *by key only* — the entities live in
+other stores (projects.db, per-board kanban.db, state.db, cron/jobs.json),
+so there is no cross-DB FK to enforce; read paths resolve keys lazily and
+``prune`` clears the leftovers.
+
+Scope: **per-profile**, stored at ``$HERMES_HOME/tags.db`` like projects /
+sessions / cron. Kanban boards are root-anchored and shared across profiles,
+so board/task tags are a per-profile view — an accepted trade-off.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import re
+import sqlite3
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Set, Tuple
+
+from hermes_constants import get_hermes_home
+
+VALID_ENTITY_TYPES: tuple[str, ...] = (
+    "project", "board", "task", "session", "cron_job",
+)
+
+SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS tags (
+    id          INTEGER PRIMARY KEY,
+    name        TEXT NOT NULL UNIQUE,
+    color       TEXT,
+    description TEXT,
+    created_at  INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS tag_assignments (
+    tag_id      INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
+    entity_type TEXT NOT NULL,
+    entity_key  TEXT NOT NULL,
+    created_at  INTEGER NOT NULL,
+    PRIMARY KEY (tag_id, entity_type, entity_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_tag_assignments_entity
+    ON tag_assignments(entity_type, entity_key);
+"""
+
+# First char must be a word char: names starting with '-'/'+' would be
+# ambiguous inside the "+add,-remove" assignment spec syntax.
+_NAME_RE = re.compile(r"^\w[\w-]{0,63}$", re.UNICODE)
+_COLOR_RE = re.compile(r"^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$")
+
+
+def tags_db_path() -> Path:
+    """The per-profile tags DB path (``$HERMES_HOME/tags.db``)."""
+    return get_hermes_home() / "tags.db"
+
+
+def normalize_tag_name(raw: str) -> str:
+    """Trim, casefold, dash inner whitespace; reject anything else."""
+    s = re.sub(r"\s+", "-", str(raw or "").strip().casefold())
+    if not s:
+        raise ValueError("tag name is empty")
+    if not _NAME_RE.match(s):
+        bad = sorted({c for c in s if not re.match(r"[\w-]", c, re.UNICODE)})
+        if bad:
+            offenders = " ".join(f"'{c}'" for c in bad)
+            raise ValueError(f"invalid characters {offenders} in tag name {raw!r}")
+        raise ValueError(
+            f"invalid tag name {raw!r}: 1-64 word characters or '-', "
+            f"not starting with '-' or '+'"
+        )
+    return s
+
+
+def validate_color(color: Optional[str]) -> Optional[str]:
+    if color is None:
+        return None
+    c = str(color).strip()
+    if not _COLOR_RE.match(c):
+        raise ValueError(f"invalid color {color!r}: must be #rgb or #rrggbb")
+    return c
+
+
+def task_key(board_slug: str, task_id: str) -> str:
+    """Composite key for tasks — ids are only unique per board."""
+    return f"{board_slug}/{task_id}"
+
+
+def _now() -> int:
+    return int(time.time())
+
+
+_INITIALIZED_PATHS: set[str] = set()
+
+
+def connect(db_path: Optional[Path] = None) -> sqlite3.Connection:
+    """Open (and initialize if needed) the per-profile tags DB."""
+    path = db_path if db_path is not None else tags_db_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    resolved = str(path.resolve())
+    conn = sqlite3.connect(str(path))
+    try:
+        conn.row_factory = sqlite3.Row
+        from hermes_state import apply_wal_with_fallback
+
+        apply_wal_with_fallback(conn, db_label="tags.db")
+        conn.execute("PRAGMA foreign_keys=ON")
+        if resolved not in _INITIALIZED_PATHS:
+            conn.executescript(SCHEMA_SQL)
+            _INITIALIZED_PATHS.add(resolved)
+    except Exception:
+        conn.close()
+        raise
+    return conn
+
+
+@contextlib.contextmanager
+def connect_closing(db_path: Optional[Path] = None):
+    """Open a tags DB connection and guarantee close (mirrors projects_db)."""
+    conn = connect(db_path=db_path)
+    try:
+        yield conn
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
