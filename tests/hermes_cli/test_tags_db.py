@@ -102,3 +102,66 @@ class TestRegistryCrud:
         counts = tdb.delete_tag(conn, "acme")
         assert counts == {}
         tdb.create_tag(conn, "acme")  # name reusable immediately
+
+
+class TestAssignments:
+    @pytest.fixture(autouse=True)
+    def seed(self, conn):
+        tdb.create_tag(conn, "acme")
+        tdb.create_tag(conn, "urgent")
+
+    def test_parse_tag_spec(self):
+        assert tdb.parse_tag_spec("+acme,-urgent,night") == (
+            ["acme", "night"], ["urgent"])
+        with pytest.raises(ValueError):
+            tdb.parse_tag_spec("+a,-a")
+        with pytest.raises(ValueError):
+            tdb.parse_tag_spec("  ")
+
+    def test_apply_spec_add_remove_idempotent(self, conn):
+        added, removed = tdb.apply_spec(conn, "task", "b/t_1", "acme,urgent")
+        assert set(added) == {"acme", "urgent"} and removed == []
+        added, removed = tdb.apply_spec(conn, "task", "b/t_1", "+acme,-urgent")
+        assert added == [] and removed == ["urgent"]
+        assert tdb.tags_for_entity(conn, "task", "b/t_1") == ["acme"]
+
+    def test_apply_spec_unknown_tag_hints_create(self, conn):
+        with pytest.raises(ValueError, match="hermes tag create urgnet"):
+            tdb.apply_spec(conn, "task", "b/t_1", "+urgnet")
+
+    def test_apply_spec_rejects_bad_entity_type(self, conn):
+        with pytest.raises(ValueError, match="entity type"):
+            tdb.apply_spec(conn, "widget", "w_1", "+acme")
+
+    def test_entity_keys_for_tags_is_intersection(self, conn):
+        tdb.apply_spec(conn, "project", "p_1", "acme,urgent")
+        tdb.apply_spec(conn, "project", "p_2", "acme")
+        assert tdb.entity_keys_for_tags(conn, "project", ["acme"]) == {"p_1", "p_2"}
+        assert tdb.entity_keys_for_tags(conn, "project", ["acme", "urgent"]) == {"p_1"}
+        with pytest.raises(ValueError, match="unknown tag"):
+            tdb.entity_keys_for_tags(conn, "project", ["nope"])
+
+    def test_entities_for_tag_groups_by_type(self, conn):
+        tdb.apply_spec(conn, "project", "p_1", "+acme")
+        tdb.apply_spec(conn, "board", "b", "+acme")
+        assert tdb.entities_for_tag(conn, "acme") == {
+            "board": ["b"], "project": ["p_1"]}
+
+    def test_tags_for_entities_bulk(self, conn):
+        tdb.apply_spec(conn, "session", "s1", "+acme")
+        out = tdb.tags_for_entities(conn, "session", ["s1", "s2"])
+        assert out == {"s1": ["acme"]}
+
+    def test_detach_board_drops_board_and_its_tasks_only(self, conn):
+        tdb.apply_spec(conn, "board", "b", "+acme")
+        tdb.apply_spec(conn, "task", "b/t_1", "+acme")
+        tdb.apply_spec(conn, "task", "b2/t_1", "+acme")
+        assert tdb.detach_board(conn, "b") == 2
+        assert tdb.entities_for_tag(conn, "acme") == {"task": ["b2/t_1"]}
+
+    def test_prune_deletes_only_unresolvable(self, conn):
+        tdb.apply_spec(conn, "project", "p_live", "+acme")
+        tdb.apply_spec(conn, "project", "p_dead", "+acme")
+        deleted = tdb.prune(conn, {"project": lambda keys: {"p_live"}})
+        assert deleted == {"project": 1}
+        assert tdb.entities_for_tag(conn, "acme") == {"project": ["p_live"]}

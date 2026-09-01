@@ -224,3 +224,170 @@ def delete_tag(conn: sqlite3.Connection, name: str) -> Dict[str, int]:
         conn.execute("DELETE FROM tag_assignments WHERE tag_id = ?", (tag.id,))
         conn.execute("DELETE FROM tags WHERE id = ?", (tag.id,))
     return counts
+
+
+# ---------------------------------------------------------------------------
+# Assignments
+# ---------------------------------------------------------------------------
+
+
+def _check_entity_type(entity_type: str) -> str:
+    if entity_type not in VALID_ENTITY_TYPES:
+        raise ValueError(
+            f"invalid entity type {entity_type!r} "
+            f"(expected one of {', '.join(VALID_ENTITY_TYPES)})")
+    return entity_type
+
+
+def parse_tag_spec(spec: str) -> Tuple[List[str], List[str]]:
+    """Parse ``"+a,-b,c"`` → (adds, removes). Bare names are adds."""
+    adds: List[str] = []
+    removes: List[str] = []
+    for part in str(spec or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if part.startswith("-"):
+            removes.append(normalize_tag_name(part[1:]))
+        else:
+            adds.append(normalize_tag_name(part.removeprefix("+")))
+    if not adds and not removes:
+        raise ValueError("empty tag spec")
+    both = set(adds) & set(removes)
+    if both:
+        raise ValueError(f"tag(s) both added and removed: {', '.join(sorted(both))}")
+    return adds, removes
+
+
+def _resolve_known(conn: sqlite3.Connection, names: Iterable[str]) -> Dict[str, int]:
+    """Names → ids, erroring on the first unknown (strict registry)."""
+    out: Dict[str, int] = {}
+    for name in names:
+        tag = get_tag(conn, name)
+        if tag is None:
+            raise ValueError(
+                f"unknown tag {name!r}\n"
+                f"  create it first:  hermes tag create {name}")
+        out[tag.name] = tag.id
+    return out
+
+
+def apply_spec(conn: sqlite3.Connection, entity_type: str, entity_key: str,
+               spec: str) -> Tuple[List[str], List[str]]:
+    _check_entity_type(entity_type)
+    adds, removes = parse_tag_spec(spec)
+    ids = _resolve_known(conn, adds + removes)
+    added: List[str] = []
+    removed: List[str] = []
+    with conn:
+        for name in adds:
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO tag_assignments "
+                "(tag_id, entity_type, entity_key, created_at) VALUES (?, ?, ?, ?)",
+                (ids[name], entity_type, entity_key, _now()))
+            if cur.rowcount:
+                added.append(name)
+        for name in removes:
+            cur = conn.execute(
+                "DELETE FROM tag_assignments WHERE tag_id = ? "
+                "AND entity_type = ? AND entity_key = ?",
+                (ids[name], entity_type, entity_key))
+            if cur.rowcount:
+                removed.append(name)
+    return added, removed
+
+
+def tags_for_entity(conn: sqlite3.Connection, entity_type: str,
+                    entity_key: str) -> List[str]:
+    _check_entity_type(entity_type)
+    rows = conn.execute(
+        "SELECT t.name FROM tag_assignments a JOIN tags t ON t.id = a.tag_id "
+        "WHERE a.entity_type = ? AND a.entity_key = ? ORDER BY t.name",
+        (entity_type, entity_key)).fetchall()
+    return [r["name"] for r in rows]
+
+
+def tags_for_entities(conn: sqlite3.Connection, entity_type: str,
+                      keys: Iterable[str]) -> Dict[str, List[str]]:
+    _check_entity_type(entity_type)
+    keys = list(keys)
+    out: Dict[str, List[str]] = {}
+    CHUNK = 500  # SQLite default max host parameters is 999
+    for i in range(0, len(keys), CHUNK):
+        chunk = keys[i:i + CHUNK]
+        marks = ",".join("?" * len(chunk))
+        rows = conn.execute(
+            f"SELECT a.entity_key, t.name FROM tag_assignments a "
+            f"JOIN tags t ON t.id = a.tag_id "
+            f"WHERE a.entity_type = ? AND a.entity_key IN ({marks}) "
+            f"ORDER BY t.name",
+            (entity_type, *chunk)).fetchall()
+        for r in rows:
+            out.setdefault(r["entity_key"], []).append(r["name"])
+    return out
+
+
+def entity_keys_for_tags(conn: sqlite3.Connection, entity_type: str,
+                         names: Iterable[str]) -> Set[str]:
+    _check_entity_type(entity_type)
+    ids = _resolve_known(conn, names)
+    if not ids:
+        raise ValueError("no tag names given")
+    marks = ",".join("?" * len(ids))
+    rows = conn.execute(
+        f"SELECT entity_key FROM tag_assignments "
+        f"WHERE entity_type = ? AND tag_id IN ({marks}) "
+        f"GROUP BY entity_key HAVING COUNT(DISTINCT tag_id) = ?",
+        (entity_type, *ids.values(), len(ids))).fetchall()
+    return {r["entity_key"] for r in rows}
+
+
+def entities_for_tag(conn: sqlite3.Connection, name: str) -> Dict[str, List[str]]:
+    tag = _require_tag(conn, name)
+    rows = conn.execute(
+        "SELECT entity_type, entity_key FROM tag_assignments "
+        "WHERE tag_id = ? ORDER BY entity_type, entity_key", (tag.id,)).fetchall()
+    out: Dict[str, List[str]] = {}
+    for r in rows:
+        out.setdefault(r["entity_type"], []).append(r["entity_key"])
+    return out
+
+
+def detach_board(conn: sqlite3.Connection, board_slug: str) -> int:
+    """Drop all assignments for a board + its tasks (slug-reuse guard)."""
+    with conn:
+        cur = conn.execute(
+            "DELETE FROM tag_assignments WHERE "
+            "(entity_type = 'board' AND entity_key = ?) OR "
+            "(entity_type = 'task' AND entity_key LIKE ? || '/%')",
+            (board_slug, board_slug))
+    return cur.rowcount
+
+
+def prune(conn: sqlite3.Connection, resolvers) -> Dict[str, int]:
+    """Delete assignments whose entity no longer exists.
+
+    ``resolvers`` maps entity_type → callable(keys) returning the subset of
+    keys that still exist in that entity's home store. Types without a
+    resolver are left untouched.
+    """
+    deleted: Dict[str, int] = {}
+    for etype, resolve in resolvers.items():
+        _check_entity_type(etype)
+        rows = conn.execute(
+            "SELECT DISTINCT entity_key FROM tag_assignments "
+            "WHERE entity_type = ?", (etype,)).fetchall()
+        keys = [r["entity_key"] for r in rows]
+        if not keys:
+            continue
+        live = set(resolve(keys))
+        dead = [k for k in keys if k not in live]
+        if not dead:
+            continue
+        with conn:
+            for key in dead:
+                conn.execute(
+                    "DELETE FROM tag_assignments "
+                    "WHERE entity_type = ? AND entity_key = ?", (etype, key))
+        deleted[etype] = len(dead)
+    return deleted
