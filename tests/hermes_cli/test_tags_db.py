@@ -64,3 +64,41 @@ def test_connect_creates_schema(conn):
     names = {r["name"] for r in conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table'")}
     assert {"tags", "tag_assignments"} <= names
+
+
+class TestRegistryCrud:
+    def test_create_normalizes_and_roundtrips(self, conn):
+        tag = tdb.create_tag(conn, "Client Acme", color="#e11d48",
+                             description="Acme Corp work")
+        assert tag.name == "client-acme"
+        got = tdb.get_tag(conn, "CLIENT ACME")
+        assert got is not None and got.id == tag.id
+        assert got.color == "#e11d48" and got.description == "Acme Corp work"
+
+    def test_create_duplicate_errors(self, conn):
+        tdb.create_tag(conn, "acme")
+        with pytest.raises(ValueError, match="already exists"):
+            tdb.create_tag(conn, "ACME")
+
+    def test_list_sorted_by_name(self, conn):
+        tdb.create_tag(conn, "zeta")
+        tdb.create_tag(conn, "alpha")
+        assert [t.name for t in tdb.list_tags(conn)] == ["alpha", "zeta"]
+
+    def test_rename_keeps_id_and_rejects_collision(self, conn):
+        tag = tdb.create_tag(conn, "client-acme")
+        tdb.create_tag(conn, "urgent")
+        renamed = tdb.rename_tag(conn, "client-acme", "acme")
+        assert renamed.id == tag.id and renamed.name == "acme"
+        with pytest.raises(ValueError, match="already exists"):
+            tdb.rename_tag(conn, "acme", "urgent")
+
+    def test_rename_unknown_errors(self, conn):
+        with pytest.raises(ValueError, match="unknown tag"):
+            tdb.rename_tag(conn, "nope", "new")
+
+    def test_delete_returns_counts_and_frees_name(self, conn):
+        tdb.create_tag(conn, "acme")
+        counts = tdb.delete_tag(conn, "acme")
+        assert counts == {}
+        tdb.create_tag(conn, "acme")  # name reusable immediately

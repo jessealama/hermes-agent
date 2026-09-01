@@ -129,3 +129,98 @@ def connect_closing(db_path: Optional[Path] = None):
             conn.close()
         except Exception:
             pass
+
+
+# ---------------------------------------------------------------------------
+# Registry CRUD
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class Tag:
+    id: int
+    name: str
+    created_at: int
+    color: Optional[str] = None
+    description: Optional[str] = None
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "name": self.name,
+            "color": self.color,
+            "description": self.description,
+            "created_at": self.created_at,
+        }
+
+
+def _row_to_tag(row: sqlite3.Row) -> Tag:
+    return Tag(id=row["id"], name=row["name"], created_at=row["created_at"],
+               color=row["color"], description=row["description"])
+
+
+def create_tag(conn: sqlite3.Connection, name: str, *,
+               color: Optional[str] = None,
+               description: Optional[str] = None) -> Tag:
+    norm = normalize_tag_name(name)
+    col = validate_color(color)
+    try:
+        with conn:
+            cur = conn.execute(
+                "INSERT INTO tags (name, color, description, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (norm, col, description, _now()),
+            )
+    except sqlite3.IntegrityError:
+        raise ValueError(f"tag {norm!r} already exists")
+    tag = get_tag(conn, norm)
+    assert tag is not None and tag.id == cur.lastrowid
+    return tag
+
+
+def get_tag(conn: sqlite3.Connection, name: str) -> Optional[Tag]:
+    norm = normalize_tag_name(name)
+    row = conn.execute("SELECT * FROM tags WHERE name = ?", (norm,)).fetchone()
+    return _row_to_tag(row) if row else None
+
+
+def _require_tag(conn: sqlite3.Connection, name: str) -> Tag:
+    tag = get_tag(conn, name)
+    if tag is None:
+        raise ValueError(f"unknown tag {normalize_tag_name(name)!r}")
+    return tag
+
+
+def list_tags(conn: sqlite3.Connection) -> List[Tag]:
+    rows = conn.execute("SELECT * FROM tags ORDER BY name").fetchall()
+    return [_row_to_tag(r) for r in rows]
+
+
+def rename_tag(conn: sqlite3.Connection, old_name: str, new_name: str) -> Tag:
+    tag = _require_tag(conn, old_name)
+    norm_new = normalize_tag_name(new_name)
+    try:
+        with conn:
+            conn.execute("UPDATE tags SET name = ? WHERE id = ?",
+                         (norm_new, tag.id))
+    except sqlite3.IntegrityError:
+        raise ValueError(f"tag {norm_new!r} already exists")
+    return Tag(id=tag.id, name=norm_new, created_at=tag.created_at,
+               color=tag.color, description=tag.description)
+
+
+def assignment_counts(conn: sqlite3.Connection, name: str) -> Dict[str, int]:
+    tag = _require_tag(conn, name)
+    rows = conn.execute(
+        "SELECT entity_type, COUNT(*) AS n FROM tag_assignments "
+        "WHERE tag_id = ? GROUP BY entity_type", (tag.id,)).fetchall()
+    return {r["entity_type"]: r["n"] for r in rows}
+
+
+def delete_tag(conn: sqlite3.Connection, name: str) -> Dict[str, int]:
+    tag = _require_tag(conn, name)
+    counts = assignment_counts(conn, tag.name)
+    with conn:
+        conn.execute("DELETE FROM tag_assignments WHERE tag_id = ?", (tag.id,))
+        conn.execute("DELETE FROM tags WHERE id = ?", (tag.id,))
+    return counts
