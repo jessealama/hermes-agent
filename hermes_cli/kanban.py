@@ -26,6 +26,7 @@ from typing import Any, Optional
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_swarm as ks
+from hermes_cli import tags_db
 
 
 # ---------------------------------------------------------------------------
@@ -49,14 +50,17 @@ def _fmt_ts(ts: Optional[int]) -> str:
     return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
 
 
-def _fmt_task_line(t: kb.Task) -> str:
+def _fmt_task_line(t: kb.Task, tags: Optional[list[str]] = None) -> str:
     icon = _STATUS_ICONS.get(t.status, "?")
     assignee = t.assignee or "(unassigned)"
     tenant = f" [{t.tenant}]" if t.tenant else ""
-    return f"{icon} {t.id}  {t.status:8s}  {assignee:20s}{tenant}  {t.title}"
+    suffix = "  " + " ".join(f"#{n}" for n in tags) if tags else ""
+    return (
+        f"{icon} {t.id}  {t.status:8s}  {assignee:20s}{tenant}  {t.title}{suffix}"
+    )
 
 
-def _task_to_dict(t: kb.Task) -> dict[str, Any]:
+def _task_to_dict(t: kb.Task, tags: Optional[list[str]] = None) -> dict[str, Any]:
     return {
         "id": t.id,
         "title": t.title,
@@ -81,7 +85,42 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "session_id": t.session_id,
         "workflow_template_id": t.workflow_template_id,
         "current_step_key": t.current_step_key,
+        # Always present (empty when untagged) so consumers need no null check.
+        "tags": list(tags or []),
     }
+
+
+def _effective_board() -> str:
+    """Board slug tag keys are namespaced by.
+
+    Safe to call inside any dispatched handler: ``kanban_command`` has
+    already pushed the ``--board`` override onto the current-board
+    contextvar, so this returns the normalized, effective slug.
+    """
+    return kb.get_current_board()
+
+
+def _task_tags(board: str, task_id: str) -> list[str]:
+    """Tags on one task. Best-effort — tags never break a kanban command."""
+    try:
+        with tags_db.connect_closing() as tconn:
+            return tags_db.tags_for_entity(
+                tconn, "task", tags_db.task_key(board, task_id)
+            )
+    except Exception:
+        return []
+
+
+def _task_tag_map(board: str, tasks) -> dict[str, list[str]]:
+    """Bulk ``task_id -> [tag names]`` in one query. Best-effort."""
+    try:
+        with tags_db.connect_closing() as tconn:
+            by_key = tags_db.tags_for_entities(
+                tconn, "task", [tags_db.task_key(board, t.id) for t in tasks]
+            )
+    except Exception:
+        return {}
+    return {t.id: by_key.get(tags_db.task_key(board, t.id), []) for t in tasks}
 
 
 def _run_state_kwargs(args: argparse.Namespace) -> Optional[dict[str, str]]:
@@ -437,6 +476,9 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                           help="Initial card status. Use 'blocked' for cards "
                                "that require immediate human ops (R3 gate) "
                                "to skip the brief running-to-blocked transition.")
+    p_create.add_argument("--tags", default=None,
+                          help="Comma-separated existing tag names "
+                               "(create them first with `hermes tag create`)")
     p_create.add_argument("--json", action="store_true", help="Emit JSON output")
 
     # --- swarm ---
@@ -492,6 +534,10 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         dest="current_step_key",
         metavar="KEY",
         help="Restrict to tasks with this current_step_key",
+    )
+    p_list.add_argument(
+        "--tag", action="append", default=[], metavar="NAME",
+        help="Filter by tag (repeatable = AND)",
     )
 
     # --- show ---
@@ -659,6 +705,15 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         default=None,
         help="JSON dict of structured facts to store on the latest completed run.",
     )
+
+    # Tags live outside the task row (tags.db), so they get their own
+    # subcommand rather than riding on `edit` — which is contractually
+    # restricted to recovery fields on already-completed tasks.
+    p_tag = sub.add_parser(
+        "tag", help="Add/remove task tags: '+name' adds, '-name' removes"
+    )
+    p_tag.add_argument("task_id")
+    p_tag.add_argument("spec", help='e.g. "+urgent,-triage"')
 
     p_block = sub.add_parser("block", help="Mark one or more tasks blocked")
     p_block.add_argument("task_id")
@@ -1165,6 +1220,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "attach-rm": _cmd_attach_rm,
             "complete": _cmd_complete,
             "edit":     _cmd_edit,
+            "tag":      _cmd_tag,
             "block":    _cmd_block,
             "schedule": _cmd_schedule,
             "unblock":  _cmd_unblock,
@@ -1247,6 +1303,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "specify",
     "decompose",
     "gc",
+    "tag",
 })
 
 _DELEGATED_CHILD_DENIED_BOARD_ACTIONS: frozenset[str] = frozenset({
@@ -1688,8 +1745,20 @@ def _cmd_create(args: argparse.Namespace) -> int:
             initial_status=getattr(args, "initial_status", "running"),
         )
         task = kb.get_task(conn, task_id)
+    board = _effective_board()
+    if getattr(args, "tags", None):
+        try:
+            with tags_db.connect_closing() as tconn:
+                tags_db.apply_spec(
+                    tconn, "task", tags_db.task_key(board, task_id), args.tags
+                )
+        except ValueError as exc:
+            print(f"kanban: {exc}", file=sys.stderr)
+            print(f"Created {task_id} (untagged)", file=sys.stderr)
+            return 2
     if getattr(args, "json", False):
-        print(json.dumps(_task_to_dict(task), indent=2, ensure_ascii=False))
+        print(json.dumps(_task_to_dict(task, _task_tags(board, task_id)),
+                         indent=2, ensure_ascii=False))
     else:
         print(f"Created {task_id}  ({task.status}, assignee={task.assignee or '-'})")
 
@@ -1757,8 +1826,20 @@ def _cmd_list(args: argparse.Namespace) -> int:
             workflow_template_id=args.workflow_template_id,
             current_step_key=args.current_step_key,
         )
+    board = _effective_board()
+    wanted = getattr(args, "tag", None)
+    if wanted:
+        try:
+            with tags_db.connect_closing() as tconn:
+                keys = tags_db.entity_keys_for_tags(tconn, "task", wanted)
+        except ValueError as exc:
+            print(f"kanban: {exc}", file=sys.stderr)
+            return 2
+        tasks = [t for t in tasks if tags_db.task_key(board, t.id) in keys]
+    tag_map = _task_tag_map(board, tasks)
     if getattr(args, "json", False):
-        print(json.dumps([_task_to_dict(t) for t in tasks], indent=2, ensure_ascii=False))
+        print(json.dumps([_task_to_dict(t, tag_map.get(t.id)) for t in tasks],
+                         indent=2, ensure_ascii=False))
         return 0
     # Passive discoverability: when the user has multiple boards, surface
     # which one they're looking at in the list header. Single-board users
@@ -1779,7 +1860,7 @@ def _cmd_list(args: argparse.Namespace) -> int:
         print("(no matching tasks)")
         return 0
     for t in tasks:
-        print(_fmt_task_line(t))
+        print(_fmt_task_line(t, tag_map.get(t.id)))
     return 0
 
 
@@ -1811,7 +1892,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
 
     if getattr(args, "json", False):
         payload = {
-            "task": _task_to_dict(task),
+            "task": _task_to_dict(task, _task_tags(_effective_board(), task.id)),
             "latest_summary": latest_summary,
             "parents": parents,
             "children": children,
@@ -1859,6 +1940,9 @@ def _cmd_show(args: argparse.Namespace) -> int:
         print(f"  branch:    {task.branch_name}")
     if task.skills:
         print(f"  skills:    {', '.join(task.skills)}")
+    _show_tags = _task_tags(_effective_board(), task.id)
+    if _show_tags:
+        print(f"  tags:      {', '.join(_show_tags)}")
     if task.model_override:
         _prov = f" (provider: {task.provider_override})" if task.provider_override else ""
         print(f"  model:     {task.model_override}{_prov}")
@@ -2404,6 +2488,29 @@ def _cmd_complete(args: argparse.Namespace) -> int:
             else:
                 print(f"Completed {tid}")
     return 0 if not failed else 1
+
+
+def _cmd_tag(args: argparse.Namespace) -> int:
+    board = _effective_board()
+    with kb.connect_closing() as conn:
+        if kb.get_task(conn, args.task_id) is None:
+            print(f"kanban: unknown task {args.task_id}", file=sys.stderr)
+            return 2
+    try:
+        with tags_db.connect_closing() as tconn:
+            added, removed = tags_db.apply_spec(
+                tconn, "task", tags_db.task_key(board, args.task_id), args.spec
+            )
+    except ValueError as exc:
+        print(f"kanban: {exc}", file=sys.stderr)
+        return 2
+    for name in added:
+        print(f"+ {name}")
+    for name in removed:
+        print(f"- {name}")
+    if not added and not removed:
+        print("No changes.")
+    return 0
 
 
 def _cmd_edit(args: argparse.Namespace) -> int:
