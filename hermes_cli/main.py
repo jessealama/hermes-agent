@@ -5905,6 +5905,13 @@ def cmd_project(args):
     return projects_command(args)
 
 
+def cmd_tag(args):
+    """Manage the per-profile tag registry."""
+    from hermes_cli.tags_cmd import tags_command
+
+    return tags_command(args)
+
+
 def cmd_hooks(args):
     """Shell-hook inspection and management."""
     from hermes_cli.hooks import hooks_command
@@ -12522,7 +12529,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "prompt-size",
         "resume",
         "send", "sessions", "setup",
-        "skin", "skills", "slack", "status", "sync", "tools", "uninstall", "update",
+        "skin", "skills", "slack", "status", "sync", "tag", "tools", "uninstall", "update",
         "webhook", "whatsapp", "whatsapp-cloud", "worktree", "chat", "secrets", "security",
         "browser",
         "verify",
@@ -13761,6 +13768,14 @@ def main():
 
     project_parser = _build_project_parser(subparsers)
     project_parser.set_defaults(func=cmd_project)
+
+    # =========================================================================
+    # tag command — per-profile tag registry shared by every taggable entity
+    # =========================================================================
+    from hermes_cli.tags_cmd import build_parser as _build_tag_parser
+
+    tag_parser = _build_tag_parser(subparsers)
+    tag_parser.set_defaults(func=cmd_tag)
 
     # =========================================================================
     # hooks command — shell-hook inspection and management
