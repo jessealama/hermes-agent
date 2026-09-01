@@ -57,5 +57,29 @@ def test_rename_and_archive(tmp_path):
         assert len(pdb.list_projects(conn)) == 1
 
 
+def test_project_tagging_roundtrip(capsys):
+    import hermes_cli.tags_db as tdb
+
+    with tdb.connect_closing() as conn:
+        tdb.create_tag(conn, "acme")
+        tdb.create_tag(conn, "urgent")
+    _run(["create", "Foo", "--tags", "acme"])
+    _run(["create", "Bar"])
+    capsys.readouterr()
+    assert _run(["list", "--tag", "acme"]) == 0
+    out = capsys.readouterr().out
+    assert "Foo" in out and "Bar" not in out
+    # +/- spec via the tag subcommand
+    assert _run(["tag", "foo", "+urgent,-acme"]) == 0
+    assert _run(["list", "--tag", "urgent"]) == 0
+    assert "Foo" in capsys.readouterr().out
+
+
+def test_project_create_unknown_tag_fails(capsys):
+    assert _run(["create", "Baz", "--tags", "nope"]) == 2
+    err = capsys.readouterr().err
+    assert "unknown tag" in err and "hermes tag create nope" in err
+
+
 
 

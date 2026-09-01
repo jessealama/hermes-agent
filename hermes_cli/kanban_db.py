@@ -1038,11 +1038,31 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
             target = archive_root / f"{normed}-{ts}-{suffix}"
             suffix += 1
         d.rename(target)
-        return {"slug": normed, "action": "archived", "new_path": str(target)}
+        result = {"slug": normed, "action": "archived", "new_path": str(target)}
     else:
         import shutil
         shutil.rmtree(d)
-        return {"slug": normed, "action": "deleted", "new_path": ""}
+        result = {"slug": normed, "action": "deleted", "new_path": ""}
+
+    _detach_board_tags(normed)
+    return result
+
+
+def _detach_board_tags(slug: str) -> None:
+    """Drop a removed board's tag assignments (board + its tasks).
+
+    Best-effort: the board is already gone, so a tags.db hiccup must not
+    turn a successful removal into an error. A future board reusing this
+    slug must not inherit the old one's tags — that is the whole point.
+    Other profiles' tags.db views are cleaned by ``hermes tag prune``.
+    """
+    try:
+        from hermes_cli import tags_db as _tags_db
+
+        with _tags_db.connect_closing() as _tconn:
+            _tags_db.detach_board(_tconn, slug)
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------

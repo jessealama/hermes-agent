@@ -17,6 +17,7 @@ import functools
 import sys
 
 from hermes_cli import projects_db as pdb
+from hermes_cli import tags_db
 
 
 def build_parser(
@@ -53,11 +54,18 @@ def build_parser(
     p_create.add_argument(
         "--use", action="store_true", help="Set as the active project"
     )
+    p_create.add_argument(
+        "--tags", default=None, help="Comma-separated existing tag names"
+    )
 
     p_list = sub.add_parser("list", aliases=["ls"], help="List projects")
     p_list.add_argument(
         "--all", action="store_true", dest="include_archived",
         help="Include archived projects",
+    )
+    p_list.add_argument(
+        "--tag", action="append", default=[], metavar="NAME",
+        help="Filter by tag (repeatable = AND)",
     )
 
     p_show = sub.add_parser("show", help="Show a project's details")
@@ -101,6 +109,12 @@ def build_parser(
         "board", nargs="?", default="", help="Board slug (omit to unbind)"
     )
 
+    p_tag = sub.add_parser(
+        "tag", help="Add/remove tags: '+name' adds, '-name' removes"
+    )
+    p_tag.add_argument("project", help="Project id or slug")
+    p_tag.add_argument("spec", help='e.g. "+urgent,-triage"')
+
     parser.set_defaults(_project_parser=parser)
     return parser
 
@@ -133,6 +147,7 @@ def projects_command(args: argparse.Namespace) -> int:
         "archive": _cmd_archive,
         "restore": _cmd_restore,
         "bind-board": _cmd_bind_board,
+        "tag": _cmd_tag,
     }
     handler = handlers.get(action)
     if handler is None:
@@ -170,10 +185,31 @@ def _with_project(fn):
     return wrapper
 
 
+def _tags_of(project_id: str) -> list:
+    """Tags on one project. Best-effort: tags are decoration, not state."""
+    try:
+        with tags_db.connect_closing() as tconn:
+            return tags_db.tags_for_entity(tconn, "project", project_id)
+    except Exception:
+        return []
+
+
+def _tags_of_many(project_ids) -> dict:
+    """Bulk ``project_id -> [tag names]``. Best-effort, one query."""
+    try:
+        with tags_db.connect_closing() as tconn:
+            return tags_db.tags_for_entities(tconn, "project", project_ids)
+    except Exception:
+        return {}
+
+
 def _print_project(proj) -> None:
     flags = " (archived)" if proj.archived else ""
     print(f"{proj.slug}  [{proj.id}]{flags}")
     print(f"  name:    {proj.name}")
+    tags = _tags_of(proj.id)
+    if tags:
+        print(f"  tags:    {', '.join(tags)}")
     if proj.description:
         print(f"  about:   {proj.description}")
     if proj.board_slug:
@@ -211,6 +247,17 @@ def _cmd_create(args: argparse.Namespace) -> int:
     if proj is None:
         print("project: vanished after create", file=sys.stderr)
         return 2
+    if getattr(args, "tags", None):
+        # After the create so the project exists to hang tags on; a bad tag
+        # name is reported against an already-created project rather than
+        # silently discarded.
+        try:
+            with tags_db.connect_closing() as tconn:
+                tags_db.apply_spec(tconn, "project", pid, args.tags)
+        except ValueError as exc:
+            print(f"project: {exc}", file=sys.stderr)
+            print(f"Created project {proj.slug} ({pid})")
+            return 2
     print(f"Created project {proj.slug} ({pid})")
     _print_project(proj)
     return 0
@@ -222,14 +269,32 @@ def _cmd_list(args: argparse.Namespace) -> int:
         projs = pdb.list_projects(
             conn, include_archived=getattr(args, "include_archived", False)
         )
+    wanted = getattr(args, "tag", None)
+    if wanted:
+        try:
+            with tags_db.connect_closing() as tconn:
+                keys = tags_db.entity_keys_for_tags(tconn, "project", wanted)
+        except ValueError as exc:
+            print(f"project: {exc}", file=sys.stderr)
+            return 2
+        projs = [p for p in projs if p.id in keys]
     if not projs:
-        print("No projects yet. Create one with `hermes project create <name>`.")
+        if wanted:
+            print(f"No projects tagged {', '.join(wanted)}.")
+        else:
+            print("No projects yet. Create one with `hermes project create <name>`.")
         return 0
+    tag_map = _tags_of_many([p.id for p in projs])
     for p in projs:
         marker = "*" if p.id == active else " "
         flags = " (archived)" if p.archived else ""
         nfolders = len(p.folders)
-        print(f"{marker} {p.slug:<24} {p.name}{flags}  [{nfolders} folder(s)]")
+        tags = tag_map.get(p.id) or []
+        suffix = "  " + " ".join(f"#{t}" for t in tags) if tags else ""
+        print(
+            f"{marker} {p.slug:<24} {p.name}{flags}  "
+            f"[{nfolders} folder(s)]{suffix}"
+        )
     return 0
 
 
@@ -311,6 +376,19 @@ def _cmd_bind_board(args, conn, proj) -> int:
         _sync_board_default_workdir(proj, args.board)
     else:
         print(f"Unbound board from {proj.slug}")
+    return 0
+
+
+@_with_project
+def _cmd_tag(args, conn, proj) -> int:
+    with tags_db.connect_closing() as tconn:
+        added, removed = tags_db.apply_spec(tconn, "project", proj.id, args.spec)
+    for name in added:
+        print(f"+ {name}")
+    for name in removed:
+        print(f"- {name}")
+    if not added and not removed:
+        print("No changes.")
     return 0
 
 
