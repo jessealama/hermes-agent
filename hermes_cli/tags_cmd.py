@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import functools
 import sys
 
 from hermes_cli import tags_db
@@ -38,8 +39,94 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
 
 
 def _resolvers() -> dict:
-    """entity_type → callable(keys) -> existing-key subset. Filled in PR 2."""
-    return {}
+    """entity_type → callable(keys) -> the subset that still exists.
+
+    Assignments reference entities by key across DB boundaries, so nothing
+    enforces referential integrity — these liveness probes are how ``prune``
+    and ``show`` tell a real entity from a leftover. Every import is local:
+    ``hermes tag create`` must not pay for the kanban / state / cron stacks.
+    """
+
+    def _keep_all_on_error(fn):
+        """Never prune on doubt.
+
+        A store that is momentarily unreadable (locked, permissions, a
+        half-written file) must not be read as "none of these exist" —
+        that would delete assignments the user never asked to lose.
+        Report every key as live and let the next prune do the work.
+        """
+
+        @functools.wraps(fn)
+        def wrapper(keys):
+            try:
+                return fn(keys)
+            except Exception:
+                return set(keys)
+
+        return wrapper
+
+    @_keep_all_on_error
+    def projects(keys):
+        import hermes_cli.projects_db as pdb
+
+        with pdb.connect_closing() as conn:
+            return {k for k in keys if pdb.get_project(conn, k) is not None}
+
+    @_keep_all_on_error
+    def boards(keys):
+        import hermes_cli.kanban_db as kb
+
+        return {k for k in keys if kb.board_exists(k)}
+
+    @_keep_all_on_error
+    def tasks(keys):
+        import hermes_cli.kanban_db as kb
+
+        by_board: dict = {}
+        for key in keys:
+            slug, _, task_id = key.partition("/")
+            by_board.setdefault(slug, []).append(task_id)
+        live: set = set()
+        for slug, ids in by_board.items():
+            # A gone board takes its tasks with it — no DB to open.
+            if not slug or not kb.board_exists(slug):
+                continue
+            with kb.connect_closing(board=slug) as conn:
+                for task_id in ids:
+                    if kb.get_task(conn, task_id) is not None:
+                        live.add(f"{slug}/{task_id}")
+        return live
+
+    @_keep_all_on_error
+    def sessions(keys):
+        from hermes_state import SessionDB, _default_db_path
+
+        # Check the path before constructing: SessionDB opens the file in
+        # its constructor, and a read-only open of a missing state.db
+        # raises rather than returning an empty DB. "No state.db" is a
+        # definite answer (no sessions exist), not the unreadable-store
+        # case the decorator guards against.
+        if not _default_db_path().exists():
+            return set()
+        db = SessionDB(read_only=True)
+        # get_session() is a bare `WHERE id = ?` — archived and hidden
+        # sessions still resolve, which is what "still exists" means here.
+        return {k for k in keys if db.get_session(k) is not None}
+
+    @_keep_all_on_error
+    def cron_jobs(keys):
+        from cron.jobs import list_jobs
+
+        ids = {job["id"] for job in list_jobs(include_disabled=True)}
+        return {k for k in keys if k in ids}
+
+    return {
+        "project": projects,
+        "board": boards,
+        "task": tasks,
+        "session": sessions,
+        "cron_job": cron_jobs,
+    }
 
 
 def _cmd_create(args) -> int:
@@ -82,10 +169,19 @@ def _cmd_show(args) -> int:
         print(f"  {tag.description}")
     if not grouped:
         print("  (not assigned to anything)")
+    resolvers = _resolvers()
     for etype, keys in grouped.items():
+        # Mark leftovers rather than hiding them: a key that no longer
+        # resolves is exactly what the user needs to see to know why a
+        # count looks wrong, and what to run about it.
+        try:
+            live = resolvers[etype](keys) if etype in resolvers else set(keys)
+        except Exception:
+            live = set(keys)
         print(f"  {etype} ({len(keys)}):")
         for key in keys:
-            print(f"    {key}")
+            suffix = "" if key in live else "  (missing — run: hermes tag prune)"
+            print(f"    {key}{suffix}")
     return 0
 
 
