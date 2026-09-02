@@ -53,6 +53,25 @@ _session_latest_descendant = late("_session_latest_descendant")
 _strip_session_list_rows = late("_strip_session_list_rows")
 
 
+def _attach_session_tags(rows: List[Dict[str, Any]]) -> None:
+    """Stamp each session row with its ``tags`` list (issue #100285, PR 5).
+
+    Always present (empty when untagged) so frontends need no null checks.
+    Best-effort: a tags.db problem must never break this hot endpoint.
+    """
+    try:
+        from hermes_cli import tags_db
+
+        with tags_db.connect_closing() as conn:
+            tag_map = tags_db.tags_for_entities(
+                conn, "session", [r["id"] for r in rows if r.get("id")]
+            )
+    except Exception:
+        tag_map = {}
+    for r in rows:
+        r["tags"] = tag_map.get(r.get("id"), [])
+
+
 def _resolve_session_id(db, session_id: str) -> Optional[str]:
     """Resolve *session_id*, distinguishing "absent" from "unreadable".
 
@@ -190,6 +209,7 @@ def get_sessions(
                 # SQLite stores the flag as 0/1; expose a real JSON boolean.
                 s["archived"] = bool(s.get("archived"))
                 s["pinned"] = bool(s.get("pinned"))
+            _attach_session_tags(sessions)
             if not full:
                 _strip_session_list_rows(sessions)
             return {"sessions": sessions, "total": total, "limit": limit, "offset": offset}
