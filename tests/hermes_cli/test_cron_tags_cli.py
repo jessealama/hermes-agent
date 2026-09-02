@@ -12,6 +12,7 @@ import pytest
 
 from cron.jobs import create_job
 from hermes_cli.cron import cron_command
+from hermes_cli.main import cmd_cron
 from hermes_cli.subcommands.cron import build_cron_parser
 from hermes_cli import tags_db as tdb
 
@@ -36,6 +37,20 @@ def _run(argv):
     build_cron_parser(subparsers, cmd_cron=cron_command)
     args = parser.parse_args(["cron", *argv])
     return cron_command(args)
+
+
+def _run_via_cmd_cron(argv):
+    """Drive through ``hermes_cli.main.cmd_cron`` — the real wrapper the CLI
+    dispatcher calls (``args.func(args)`` in ``main()``). Regression guard
+    for the wrapper dropping ``cron_command``'s return value, which used to
+    make exit-2 errors (unknown tag/job) look like success (exit 0) at the
+    process level even though the right message hit stderr.
+    """
+    parser = argparse.ArgumentParser(prog="hermes")
+    subparsers = parser.add_subparsers(dest="command")
+    build_cron_parser(subparsers, cmd_cron=cmd_cron)
+    args = parser.parse_args(["cron", *argv])
+    return cmd_cron(args)
 
 
 class TestCronTag:
@@ -160,3 +175,29 @@ class TestCronListTagFilter:
         out = capsys.readouterr().out
         assert a["id"] in out
         assert b["id"] in out
+
+
+class TestCmdCronWrapperPropagatesExitCode:
+    """Regression test for the wrapper boundary: ``hermes_cli.main.cmd_cron``
+    must propagate ``cron_command``'s return value, not just call it and
+    drop the result. ``main()``'s dispatcher (``args.func(args)``) turns a
+    non-zero int return into ``sys.exit(rc)`` — if ``cmd_cron`` discards the
+    return value, `hermes cron tag nope +x` (and `list --tag <unknown>`)
+    print the right error to stderr but the process still exits 0.
+    """
+
+    def test_list_unknown_tag_exits_2_through_cmd_cron(self, tmp_cron_dir, capsys):
+        create_job(prompt="x", schedule="0 3 * * *")
+
+        rc = _run_via_cmd_cron(["list", "--tag", "no-such-tag"])
+
+        assert rc == 2
+        assert "unknown tag" in capsys.readouterr().err
+
+    def test_tag_unknown_job_id_exits_2_through_cmd_cron(self, tmp_cron_dir, capsys):
+        _seed_tags("client-acme")
+
+        rc = _run_via_cmd_cron(["tag", "nope-not-a-job", "+client-acme"])
+
+        assert rc == 2
+        assert "unknown cron job" in capsys.readouterr().err
