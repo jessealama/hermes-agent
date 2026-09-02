@@ -177,6 +177,36 @@ def _task_dict(
     return d
 
 
+def _board_tag_map(slugs: list[str]) -> dict[str, list[str]]:
+    """Bulk ``board slug -> [tag names]`` (issue #100285, PR 5).
+
+    Best-effort — a tags.db problem must never break board payloads.
+    """
+    try:
+        from hermes_cli import tags_db
+
+        with tags_db.connect_closing() as tconn:
+            return tags_db.tags_for_entities(tconn, "board", slugs)
+    except Exception:
+        return {}
+
+
+def _task_tag_map(board_slug: str, tasks) -> dict[str, list[str]]:
+    """Bulk ``task_id -> [tag names]``. Best-effort, like :func:`_board_tag_map`."""
+    try:
+        from hermes_cli import tags_db
+
+        with tags_db.connect_closing() as tconn:
+            by_key = tags_db.tags_for_entities(
+                tconn, "task", [tags_db.task_key(board_slug, t.id) for t in tasks]
+            )
+        return {
+            t.id: by_key.get(tags_db.task_key(board_slug, t.id), []) for t in tasks
+        }
+    except Exception:
+        return {}
+
+
 def _event_dict(event: kanban_db.Event) -> dict[str, Any]:
     return {
         "id": event.id,
@@ -462,12 +492,19 @@ def get_board(
         # preview here — the full text is available via /tasks/:id.
         summary_map = kanban_db.latest_summaries(conn, [t.id for t in tasks])
 
+        # Tag names per task, always present (empty when untagged) so the
+        # frontend needs no null checks. Keys are namespaced by the
+        # effective board slug (the query param, or the active board when
+        # the caller omitted it).
+        tag_map = _task_tag_map(board or kanban_db.get_current_board(), tasks)
+
         for t in tasks:
             full = summary_map.get(t.id)
             preview = (
                 full[:_CARD_SUMMARY_PREVIEW_CHARS] if full else None
             )
             d = _task_dict(t, latest_summary=preview)
+            d["tags"] = tag_map.get(t.id, [])
             d["link_counts"] = link_counts.get(t.id, {"parents": 0, "children": 0})
             d["comment_count"] = comment_counts.get(t.id, 0)
             d["progress"] = progress.get(t.id)  # None when the task has no children
@@ -2486,8 +2523,10 @@ def list_boards(include_archived: bool = Query(False)):
     boards = kanban_db.list_boards(include_archived=include_archived)
     current = kanban_db.get_current_board()
     proj_map = _projects_by_id()
+    tag_map = _board_tag_map([b["slug"] for b in boards])
     for b in boards:
         b["is_current"] = (b["slug"] == current)
+        b["tags"] = tag_map.get(b["slug"], [])
         b["counts"] = _board_counts(b["slug"])
         # Live cards only — archived tasks are hidden from every default
         # board view, so advertising them in the switcher badge makes the
