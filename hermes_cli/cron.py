@@ -180,11 +180,13 @@ def _dispatch_display(dispatch: dict) -> Optional[str]:
     )
 
 
-def cron_list(show_all: bool = False):
+def cron_list(show_all: bool = False, only_ids: Optional[set[str]] = None):
     """List all scheduled jobs."""
     from cron.jobs import list_jobs
 
     jobs = list_jobs(include_disabled=show_all)
+    if only_ids is not None:
+        jobs = [j for j in jobs if j.get("id") in only_ids]
 
     if not jobs:
         print(color("No scheduled jobs.", Colors.DIM))
@@ -906,6 +908,33 @@ def cron_edit(args):
     return 0
 
 
+def cron_tag(args) -> int:
+    from cron.jobs import AmbiguousJobReference, resolve_job_ref
+    from hermes_cli import tags_db
+    try:
+        job = resolve_job_ref(args.job_id)
+    except AmbiguousJobReference as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    if job is None:
+        print(f"unknown cron job {args.job_id!r}", file=sys.stderr)
+        return 2
+    try:
+        with tags_db.connect_closing() as tconn:
+            added, removed = tags_db.apply_spec(
+                tconn, "cron_job", job["id"], args.spec)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    for name in added:
+        print(f"+ {name}")
+    for name in removed:
+        print(f"- {name}")
+    if not added and not removed:
+        print("No changes.")
+    return 0
+
+
 def _job_action(action: str, job_id: str, success_verb: str) -> int:
     _stateless_reset = None
     if action == "run":
@@ -1058,7 +1087,18 @@ def cron_command(args):
 
     if subcmd is None or subcmd == "list":
         show_all = getattr(args, 'all', False)
-        cron_list(show_all)
+        wanted_tags = getattr(args, "tag", None)
+        only_ids = None
+        if wanted_tags:
+            from hermes_cli import tags_db
+            try:
+                with tags_db.connect_closing() as tconn:
+                    only_ids = tags_db.entity_keys_for_tags(
+                        tconn, "cron_job", wanted_tags)
+            except ValueError as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                return 2
+        cron_list(show_all, only_ids=only_ids)
         return 0
 
     if subcmd == "status":
@@ -1087,6 +1127,9 @@ def cron_command(args):
     if subcmd == "edit":
         return cron_edit(args)
 
+    if subcmd == "tag":
+        return cron_tag(args)
+
     if subcmd == "pause":
         return _job_action("pause", args.job_id, "Paused")
 
@@ -1100,5 +1143,5 @@ def cron_command(args):
         return _job_action("remove", args.job_id, "Removed")
 
     print(f"Unknown cron command: {subcmd}")
-    print("Usage: hermes cron [list|create|edit|pause|resume|run|remove|status|runs|doctor|tick]")
+    print("Usage: hermes cron [list|create|edit|tag|pause|resume|run|remove|status|runs|doctor|tick]")
     sys.exit(1)
