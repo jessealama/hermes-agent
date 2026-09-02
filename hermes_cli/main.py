@@ -14271,6 +14271,16 @@ def main():
         help="Only sessions in one workspace: a git repo root or project dir "
         "(matched by path substring or basename).",
     )
+    sessions_list.add_argument(
+        "--tag", action="append", default=[],
+        help="Filter by tag (repeatable = AND)",
+    )
+
+    sessions_tag = sessions_subparsers.add_parser(
+        "tag", help="Add/remove session tags: '+name' adds, '-name' removes"
+    )
+    sessions_tag.add_argument("session_id")
+    sessions_tag.add_argument("spec", help='e.g. "+client-acme,-old"')
 
     def _add_session_filter_args(p, default_older_help):
         p.add_argument(

@@ -326,12 +326,56 @@ def cmd_sessions(args, sessions_parser=None):
     _source = getattr(args, "source", None)
     _exclude = None if _source else ["tool"]
 
+    if action == "tag":
+        from hermes_cli import tags_db
+
+        # get_session is a bare `WHERE id = ?` — archived/hidden sessions
+        # stay taggable. (list_sessions_rich(session_key=...) would match
+        # the gateway routing key, not the id.)
+        if db.get_session(args.session_id) is None:
+            print(f"unknown session {args.session_id}", file=sys.stderr)
+            return 2
+        try:
+            with tags_db.connect_closing() as tconn:
+                added, removed = tags_db.apply_spec(
+                    tconn, "session", args.session_id, args.spec
+                )
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        for name in added:
+            print(f"+ {name}")
+        for name in removed:
+            print(f"- {name}")
+        if not added and not removed:
+            print("No changes.")
+        return 0
+
     if action == "list":
         from hermes_state import workspace_key as _ws_key
 
+        _tag_keys = None
+        if getattr(args, "tag", None):
+            from hermes_cli import tags_db
+
+            try:
+                with tags_db.connect_closing() as tconn:
+                    _tag_keys = tags_db.entity_keys_for_tags(
+                        tconn, "session", args.tag
+                    )
+            except ValueError as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                return 2
+
+        # The tag filter prunes after the fetch, so widen the window past
+        # --limit — an old tagged session must not silently vanish.
+        _fetch_limit = args.limit if _tag_keys is None else max(args.limit, 500)
         sessions = db.list_sessions_rich(
-            source=args.source, exclude_sources=_exclude, limit=args.limit
+            source=args.source, exclude_sources=_exclude, limit=_fetch_limit
         )
+        if _tag_keys is not None:
+            sessions = [s for s in sessions if s["id"] in _tag_keys]
+            sessions = sessions[: args.limit]
 
         # Workspace filter: match a session by its workspace key (git repo
         # root, else cwd) — path substring or exact basename.
