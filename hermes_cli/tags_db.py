@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 from hermes_constants import get_hermes_home
+from hermes_state_common import escape_like
 
 VALID_ENTITY_TYPES: tuple[str, ...] = (
     "project", "board", "task", "session", "cron_job",
@@ -354,13 +355,19 @@ def entities_for_tag(conn: sqlite3.Connection, name: str) -> Dict[str, List[str]
 
 
 def detach_board(conn: sqlite3.Connection, board_slug: str) -> int:
-    """Drop all assignments for a board + its tasks (slug-reuse guard)."""
+    """Drop all assignments for a board + its tasks (slug-reuse guard).
+
+    Task keys are ``<slug>/<task_id>``, matched with a prefix LIKE. Slugs
+    may contain ``_``, which LIKE treats as a single-character wildcard, so
+    the slug is escaped — otherwise removing ``my_board`` would also strip
+    the tags of ``my-board`` and ``myxboard``.
+    """
     with conn:
         cur = conn.execute(
             "DELETE FROM tag_assignments WHERE "
             "(entity_type = 'board' AND entity_key = ?) OR "
-            "(entity_type = 'task' AND entity_key LIKE ? || '/%')",
-            (board_slug, board_slug))
+            "(entity_type = 'task' AND entity_key LIKE ? ESCAPE '\\')",
+            (board_slug, escape_like(board_slug) + "/%"))
     return cur.rowcount
 
 

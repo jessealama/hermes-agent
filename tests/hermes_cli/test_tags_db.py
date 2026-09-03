@@ -159,6 +159,18 @@ class TestAssignments:
         assert tdb.detach_board(conn, "b") == 2
         assert tdb.entities_for_tag(conn, "acme") == {"task": ["b2/t_1"]}
 
+    def test_detach_board_underscore_slug_is_literal(self, conn):
+        """'_' is a LIKE wildcard; a slug containing one must not sweep up
+        sibling boards whose slugs differ only at that position."""
+        tdb.apply_spec(conn, "board", "my_board", "+acme")
+        tdb.apply_spec(conn, "task", "my_board/t_1", "+acme")
+        tdb.apply_spec(conn, "task", "my-board/t_1", "+acme")
+        tdb.apply_spec(conn, "task", "myxboard/t_1", "+acme")
+        tdb.apply_spec(conn, "task", "my_board_v2/t_1", "+acme")
+        assert tdb.detach_board(conn, "my_board") == 2
+        assert tdb.entities_for_tag(conn, "acme") == {
+            "task": ["my-board/t_1", "my_board_v2/t_1", "myxboard/t_1"]}
+
     def test_prune_deletes_only_unresolvable(self, conn):
         tdb.apply_spec(conn, "project", "p_live", "+acme")
         tdb.apply_spec(conn, "project", "p_dead", "+acme")

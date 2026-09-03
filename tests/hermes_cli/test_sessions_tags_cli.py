@@ -107,3 +107,27 @@ def test_list_tag_filter_reaches_past_limit(state_db_path, capsys):
     rc = sc.cmd_sessions(_args("list", tag=["client-acme"], limit=1))
     assert rc in (0, None)
     assert "sess_tagged01" in capsys.readouterr().out
+
+
+def test_list_tag_filter_reaches_past_500_newer_sessions(state_db_path, capsys):
+    """The tag filter must not depend on a fixed fetch window: a tagged
+    session buried under hundreds of newer ones still has to appear."""
+    from hermes_state import SessionDB
+
+    _seed_tags("client-acme")
+    with sqlite3.connect(state_db_path) as conn:
+        conn.execute(
+            "UPDATE sessions SET started_at = started_at - 3600 "
+            "WHERE id = 'sess_tagged01'")
+    db = SessionDB(state_db_path)
+    for i in range(600):
+        db.create_session(f"sess_filler{i:04d}", "cli")
+    db.close()
+    assert sc.cmd_sessions(_args("tag", session_id="sess_tagged01",
+                                 spec="+client-acme")) == 0
+    capsys.readouterr()
+    rc = sc.cmd_sessions(_args("list", tag=["client-acme"]))
+    assert rc in (0, None)
+    out = capsys.readouterr().out
+    assert "sess_tagged01" in out
+    assert "sess_filler" not in out

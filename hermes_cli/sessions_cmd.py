@@ -367,15 +367,13 @@ def cmd_sessions(args, sessions_parser=None):
                 print(f"error: {exc}", file=sys.stderr)
                 return 2
 
-        # The tag filter prunes after the fetch, so widen the window past
-        # --limit — an old tagged session must not silently vanish.
-        _fetch_limit = args.limit if _tag_keys is None else max(args.limit, 500)
+        # The tag filter is pushed into the query, so --limit windows over
+        # the tagged sessions themselves — an old tagged session must not
+        # silently vanish behind newer untagged ones.
         sessions = db.list_sessions_rich(
-            source=args.source, exclude_sources=_exclude, limit=_fetch_limit
+            source=args.source, exclude_sources=_exclude, limit=args.limit,
+            session_ids=_tag_keys,
         )
-        if _tag_keys is not None:
-            sessions = [s for s in sessions if s["id"] in _tag_keys]
-            sessions = sessions[: args.limit]
 
         # Workspace filter: match a session by its workspace key (git repo
         # root, else cwd) — path substring or exact basename.
