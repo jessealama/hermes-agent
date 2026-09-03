@@ -22,6 +22,8 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     # cron list
     cron_list = cron_subparsers.add_parser("list", help="List scheduled jobs")
     cron_list.add_argument("--all", action="store_true", help="Include disabled jobs")
+    cron_list.add_argument("--tag", action="append", default=[], metavar="NAME",
+                           help="Filter by tag (repeatable = AND)")
 
     # cron create/add
     cron_create = cron_subparsers.add_parser(
@@ -254,6 +256,13 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
             "the pin and follow config resolution."
         ),
     )
+
+    # cron tag
+    cron_tag = cron_subparsers.add_parser(
+        "tag", help="Add/remove cron job tags: '+name' adds, '-name' removes",
+    )
+    cron_tag.add_argument("job_id", help="Job ID (or unambiguous name) to tag")
+    cron_tag.add_argument("spec", help='e.g. "+client-acme,-old"')
 
     # lifecycle actions
     cron_pause = cron_subparsers.add_parser("pause", help="Pause a scheduled job")

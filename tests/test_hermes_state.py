@@ -2337,6 +2337,22 @@ class TestListSessionsRich:
         assert len(sessions) == 1
         assert "Help me refactor the auth module" in sessions[0]["preview"]
 
+    def test_session_ids_filter_restricts_in_sql(self, db):
+        """``session_ids`` must narrow the query itself, so LIMIT applies
+        to the matching rows rather than to the newest rows overall."""
+        for i in range(5):
+            db.create_session(f"s{i}", "cli")
+        # Backdate s0 so it sorts last; a limit of 1 must still surface it.
+        db._conn.execute(
+            "UPDATE sessions SET started_at = started_at - 3600 WHERE id = 's0'")
+        db._conn.commit()
+        rows = db.list_sessions_rich(session_ids={"s0", "s3"}, limit=1)
+        assert [r["id"] for r in rows] == ["s3"]
+        rows = db.list_sessions_rich(session_ids={"s0"}, limit=1)
+        assert [r["id"] for r in rows] == ["s0"]
+        assert db.list_sessions_rich(session_ids=set()) == []
+        assert len(db.list_sessions_rich(session_ids=None)) == 5
+
 
 
 

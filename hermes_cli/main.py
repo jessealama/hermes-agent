@@ -5652,7 +5652,7 @@ def cmd_cron(args):
     """Cron job management."""
     from hermes_cli.cron import cron_command
 
-    cron_command(args)
+    return cron_command(args)
 
 
 def cmd_sync(args):
@@ -5903,6 +5903,13 @@ def cmd_project(args):
     from hermes_cli.projects_cmd import projects_command
 
     return projects_command(args)
+
+
+def cmd_tag(args):
+    """Manage the per-profile tag registry."""
+    from hermes_cli.tags_cmd import tags_command
+
+    return tags_command(args)
 
 
 def cmd_hooks(args):
@@ -12522,7 +12529,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "prompt-size",
         "resume",
         "send", "sessions", "setup",
-        "skin", "skills", "slack", "status", "sync", "tools", "uninstall", "update",
+        "skin", "skills", "slack", "status", "sync", "tag", "tools", "uninstall", "update",
         "webhook", "whatsapp", "whatsapp-cloud", "worktree", "chat", "secrets", "security",
         "browser",
         "verify",
@@ -13763,6 +13770,14 @@ def main():
     project_parser.set_defaults(func=cmd_project)
 
     # =========================================================================
+    # tag command — per-profile tag registry shared by every taggable entity
+    # =========================================================================
+    from hermes_cli.tags_cmd import build_parser as _build_tag_parser
+
+    tag_parser = _build_tag_parser(subparsers)
+    tag_parser.set_defaults(func=cmd_tag)
+
+    # =========================================================================
     # hooks command — shell-hook inspection and management
     # =========================================================================
     # hooks command  (parser built in hermes_cli/subcommands/hooks.py)
@@ -14256,6 +14271,16 @@ def main():
         help="Only sessions in one workspace: a git repo root or project dir "
         "(matched by path substring or basename).",
     )
+    sessions_list.add_argument(
+        "--tag", action="append", default=[],
+        help="Filter by tag (repeatable = AND)",
+    )
+
+    sessions_tag = sessions_subparsers.add_parser(
+        "tag", help="Add/remove session tags: '+name' adds, '-name' removes"
+    )
+    sessions_tag.add_argument("session_id")
+    sessions_tag.add_argument("spec", help='e.g. "+client-acme,-old"')
 
     def _add_session_filter_args(p, default_older_help):
         p.add_argument(

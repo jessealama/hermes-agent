@@ -58,7 +58,7 @@ from hermes_startup_watchdog import report_startup_progress
 from hermes_cli.sqlite_runtime import (
     is_sqlite_wal_reset_vulnerable as _is_sqlite_wal_reset_vulnerable,
 )
-from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple, TypeVar, cast
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Set, Tuple, TypeVar, cast
 
 from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     _BRANCH_CHILD_SQL,
@@ -11676,6 +11676,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         include_pinned: bool = False,
         session_key: str = None,
         include_hidden: bool = False,
+        session_ids: Optional[Iterable[str]] = None,
     ) -> List[Dict[str, Any]]:
         """List sessions with preview (first user message) and last active timestamp.
 
@@ -11727,6 +11728,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         obey the same filters (source, archived, min_message_count) as the
         page: an archived or filtered-out conversation stays out.
 
+        Pass ``session_ids`` to restrict results to an explicit id set (e.g.
+        the sessions carrying a tag). The filter is applied in SQL, so
+        ``limit``/``offset`` window over the matching rows rather than over
+        the newest rows overall. An empty set matches nothing.
+
         Pass ``session_key`` to restrict results to one stable gateway
         conversation scope (DM, group, channel, or thread, including the
         configured per-user isolation policy).
@@ -11763,6 +11769,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         if session_key:
             where_clauses.append("s.session_key = ?")
             params.append(session_key)
+        if session_ids is not None:
+            id_list = list(dict.fromkeys(session_ids))
+            if id_list:
+                placeholders = ",".join("?" for _ in id_list)
+                where_clauses.append(f"s.id IN ({placeholders})")
+                params.extend(id_list)
+            else:
+                where_clauses.append("0")
         if exclude_sources:
             placeholders = ",".join("?" for _ in exclude_sources)
             where_clauses.append(f"s.source NOT IN ({placeholders})")

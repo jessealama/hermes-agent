@@ -18,6 +18,7 @@ from fastapi.testclient import TestClient
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import projects_db as pdb
+from hermes_cli import tags_db as tdb
 
 
 def _load_plugin_router():
@@ -101,6 +102,39 @@ def test_boards_list_surfaces_project(client, project):
     widget = next(b for b in client.get("/api/plugins/kanban/boards").json()["boards"] if b["slug"] == "widget")
     assert widget["project_id"] == project["id"]
     assert widget["project_name"] == "Widget"
+
+
+def test_boards_list_includes_tags(client):
+    client.post("/api/plugins/kanban/boards", json={"slug": "widget", "name": "Widget"})
+    client.post("/api/plugins/kanban/boards", json={"slug": "plain", "name": "Plain"})
+    with tdb.connect_closing() as conn:
+        tdb.create_tag(conn, "acme")
+        tdb.apply_spec(conn, "board", "widget", "+acme")
+
+    boards = {b["slug"]: b for b in client.get("/api/plugins/kanban/boards").json()["boards"]}
+    assert boards["widget"]["tags"] == ["acme"]
+    assert boards["plain"]["tags"] == []
+
+
+def test_board_tasks_include_tags(client):
+    client.post("/api/plugins/kanban/boards", json={"slug": "widget", "name": "Widget"})
+    tagged = client.post(
+        "/api/plugins/kanban/tasks?board=widget", json={"title": "tagged task"}
+    ).json()["task"]["id"]
+    untagged = client.post(
+        "/api/plugins/kanban/tasks?board=widget", json={"title": "untagged task"}
+    ).json()["task"]["id"]
+    with tdb.connect_closing() as conn:
+        tdb.create_tag(conn, "acme")
+        tdb.apply_spec(conn, "task", tdb.task_key("widget", tagged), "+acme")
+
+    r = client.get("/api/plugins/kanban/board?board=widget")
+    assert r.status_code == 200, r.text
+    tasks = {
+        t["id"]: t for col in r.json()["columns"] for t in col["tasks"]
+    }
+    assert tasks[tagged]["tags"] == ["acme"]
+    assert tasks[untagged]["tags"] == []
 
 
 def test_task_on_scoped_board_inherits_project(client, project):
